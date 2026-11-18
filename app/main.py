@@ -1,6 +1,11 @@
 
+import asyncio
+import logging
 import os
 import secrets
+import time
+
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -18,17 +23,160 @@ from app.meme_pipeline import generate_complete_meme
 
 load_dotenv()
 
-app = FastAPI(title="365 Days of Cramming API")
+# Enable application logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # app/temp/memes directory
 APP_DIR = Path(__file__).resolve().parent
 TEMP_IMAGE_DIR = APP_DIR / "temp" / "memes"
 
-# Public Render URL (configured later in Render)
+# Public Render URL
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# Secret used to protect the DELETE endpoint
-DELETE_API_TOKEN = os.getenv("DELETE_API_TOKEN", "")
+# Secret used to protect the manual DELETE endpoint
+
+
+# Automatic cleanup settings
+IMAGE_RETENTION_SECONDS = 3 * 60  # 3 minutes
+CLEANUP_INTERVAL_SECONDS = 60     # Check every 1 minute
+
+
+# =====================================================
+# AUTOMATIC IMAGE CLEANUP
+# =====================================================
+
+def cleanup_expired_images() -> int:
+    """
+    Delete PNG images older than the configured retention period.
+
+    Returns:
+        Number of successfully deleted images.
+    """
+
+    TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    current_time = time.time()
+    deleted_count = 0
+
+    for image_path in TEMP_IMAGE_DIR.iterdir():
+
+        try:
+
+            # Process only PNG files
+            if not image_path.is_file():
+                continue
+
+            if image_path.suffix.lower() != ".png":
+                continue
+
+            # Calculate image age
+            modified_time = image_path.stat().st_mtime
+            image_age = current_time - modified_time
+
+            # Delete images older than 3 minutes
+            if image_age >= IMAGE_RETENTION_SECONDS:
+
+                image_path.unlink()
+                deleted_count += 1
+
+                logger.info(
+                    "Deleted expired image: %s",
+                    image_path.name
+                )
+
+        except FileNotFoundError:
+            # Another process may have already deleted the file
+            continue
+
+        except OSError as error:
+
+            logger.warning(
+                "Could not delete image %s: %s",
+                image_path.name,
+                error
+            )
+
+    return deleted_count
+
+
+async def automatic_cleanup_worker():
+    """
+    Automatically check the image folder every minute.
+    """
+
+    logger.info("Automatic image cleanup worker started.")
+
+    while True:
+
+        try:
+
+            # Run filesystem operations without blocking
+            # the FastAPI event loop
+            deleted_count = await asyncio.to_thread(
+                cleanup_expired_images
+            )
+
+            if deleted_count > 0:
+
+                logger.info(
+                    "Cleanup completed. Deleted %s image(s).",
+                    deleted_count
+                )
+
+        except Exception:
+
+            logger.exception(
+                "An error occurred during automatic image cleanup."
+            )
+
+        # Wait before checking again
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+# =====================================================
+# FASTAPI LIFESPAN
+# =====================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Ensure the temporary image directory exists
+    TEMP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Start automatic cleanup when the server starts
+    cleanup_task = asyncio.create_task(
+        automatic_cleanup_worker()
+    )
+
+    logger.info("365 Days of Cramming API started.")
+
+    try:
+
+        yield
+
+    finally:
+
+        # Stop cleanup worker when server shuts down
+        cleanup_task.cancel()
+
+        try:
+            await cleanup_task
+
+        except asyncio.CancelledError:
+            pass
+
+        logger.info("Automatic image cleanup worker stopped.")
+
+
+# =====================================================
+# FASTAPI APPLICATION
+# =====================================================
+
+app = FastAPI(
+    title="365 Days of Cramming API",
+    lifespan=lifespan
+)
 
 
 # =====================================================
@@ -36,6 +184,7 @@ DELETE_API_TOKEN = os.getenv("DELETE_API_TOKEN", "")
 # =====================================================
 
 class MemeRequest(BaseModel):
+
     target_audience: str = "College Students"
     platform: str = "Instagram"
     meme_format: str = "Single Image Meme"
@@ -52,12 +201,14 @@ def get_image_path(image_id: str) -> Path:
 
     # Prevent directory traversal
     if Path(image_id).name != image_id or image_id in {".", ".."}:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid image ID."
         )
 
     if not image_id.lower().endswith(".png"):
+
         raise HTTPException(
             status_code=400,
             detail="Invalid image format."
@@ -66,8 +217,11 @@ def get_image_path(image_id: str) -> Path:
     image_path = (TEMP_IMAGE_DIR / image_id).resolve()
 
     try:
+
         image_path.relative_to(TEMP_IMAGE_DIR.resolve())
+
     except ValueError:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid image location."
@@ -97,7 +251,10 @@ def health_check():
     "/api/v1/generate-meme",
     response_model=dict
 )
-def generate_meme(request_data: MemeRequest, request: Request):
+def generate_meme(
+    request_data: MemeRequest,
+    request: Request
+):
 
     try:
 
@@ -113,6 +270,7 @@ def generate_meme(request_data: MemeRequest, request: Request):
 
         # Check pipeline result
         if result.get("status") != "success":
+
             raise HTTPException(
                 status_code=500,
                 detail=result.get("error") or
@@ -123,6 +281,7 @@ def generate_meme(request_data: MemeRequest, request: Request):
         image_path_value = result.get("image_path")
 
         if not image_path_value:
+
             raise HTTPException(
                 status_code=500,
                 detail="Generated image path is missing."
@@ -132,8 +291,11 @@ def generate_meme(request_data: MemeRequest, request: Request):
 
         # Ensure image belongs to our temporary folder
         try:
+
             image_path.relative_to(TEMP_IMAGE_DIR.resolve())
+
         except ValueError:
+
             raise HTTPException(
                 status_code=500,
                 detail="Generated image is outside the temporary image folder."
@@ -141,6 +303,7 @@ def generate_meme(request_data: MemeRequest, request: Request):
 
         # Check image exists
         if not image_path.is_file():
+
             raise HTTPException(
                 status_code=500,
                 detail="Generated image file was not found."
@@ -150,6 +313,7 @@ def generate_meme(request_data: MemeRequest, request: Request):
         instagram_caption = result.get("instagram_caption")
 
         if not instagram_caption:
+
             raise HTTPException(
                 status_code=500,
                 detail="Instagram caption is missing."
@@ -174,7 +338,7 @@ def generate_meme(request_data: MemeRequest, request: Request):
                 )
             )
 
-        # Return ONLY the information n8n needs
+        # Return information required by Make.com
         return {
             "image_url": image_url,
             "instagram_caption": instagram_caption
@@ -183,11 +347,13 @@ def generate_meme(request_data: MemeRequest, request: Request):
     except HTTPException:
         raise
 
-    except Exception as e:
+    except Exception as error:
+
+        logger.exception("Meme generation failed.")
 
         raise HTTPException(
             status_code=500,
-            detail=f"Meme generation failed: {str(e)}"
+            detail=f"Meme generation failed: {str(error)}"
         )
 
 
@@ -204,6 +370,7 @@ def get_meme_image(image_id: str):
     image_path = get_image_path(image_id)
 
     if not image_path.is_file():
+
         raise HTTPException(
             status_code=404,
             detail="Image not found or already deleted."
@@ -217,21 +384,10 @@ def get_meme_image(image_id: str):
     )
 
 
-# =====================================================
-# 4. DELETE TEMPORARY IMAGE
-# =====================================================
-
-@app.delete("/api/v1/media/{image_id}")
-def delete_meme_image(
-    image_id: str,
-    x_delete_token: str = Header(
-        default="",
-        alias="X-Delete-Token"
-    )
-):
 
     # Require a configured secret
     if not DELETE_API_TOKEN:
+
         raise HTTPException(
             status_code=503,
             detail="Image deletion is not configured."
@@ -242,6 +398,7 @@ def delete_meme_image(
         x_delete_token,
         DELETE_API_TOKEN
     ):
+
         raise HTTPException(
             status_code=401,
             detail="Invalid deletion token."
@@ -250,6 +407,7 @@ def delete_meme_image(
     image_path = get_image_path(image_id)
 
     if not image_path.is_file():
+
         raise HTTPException(
             status_code=404,
             detail="Image not found or already deleted."
@@ -264,9 +422,9 @@ def delete_meme_image(
             "image_id": image_id
         }
 
-    except OSError as e:
+    except OSError as error:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Could not delete image: {str(e)}"
+            detail=f"Could not delete image: {str(error)}"
         )
