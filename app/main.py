@@ -38,8 +38,8 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 
 # Automatic cleanup settings
-IMAGE_RETENTION_SECONDS = 3 * 60  # 3 minutes
-CLEANUP_INTERVAL_SECONDS = 60     # Check every 1 minute
+IMAGE_RETENTION_SECONDS = 24 * 60 * 60  # 3 minutes
+CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60     # Check every 1 minute
 
 
 # =====================================================
